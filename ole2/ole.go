@@ -2,6 +2,7 @@ package ole2
 
 import (
 	"encoding/binary"
+	"fmt"
 	"io"
 )
 
@@ -64,40 +65,87 @@ func (o *Ole) OpenFile(file *File, root *File) io.ReadSeeker {
 
 // Read MSAT
 func (o *Ole) readMSAT() error {
-	// int sectorNum;
+	maxSID, sectorCount, err := o.maxRegularSID()
+	if err != nil {
+		return err
+	}
 
 	count := uint32(109)
 	if o.header.Cfat < 109 {
 		count = o.header.Cfat
 	}
 
-	for i := uint32(0); i < count; i++ {
-		if sector, err := o.sector_read(o.header.Msat[i]); err == nil {
+	var fatRead uint32
+
+	for i := uint32(0); i < count && fatRead < o.header.Cfat; i++ {
+		sid := o.header.Msat[i]
+		if sid == FREESECT || sid == ENDOFCHAIN {
+			break
+		}
+		if err := validateSID(sid, maxSID, "header MSAT FAT"); err != nil {
+			return err
+		}
+		if sector, err := o.sector_read(sid); err == nil {
 			sids := sector.AllValues(o.Lsector)
 			o.SecID = append(o.SecID, sids...)
+			fatRead++
 		} else {
 			return err
 		}
 	}
 
-	for sid := o.header.Difstart; sid != ENDOFCHAIN; {
+	// SAFETY: honor Cdif but cap it to file sector count.
+	cdifLimit := o.header.Cdif
+	if cdifLimit > sectorCount {
+		cdifLimit = sectorCount
+	}
+	visitedDif := make(map[uint32]struct{})
+	var difRead uint32
+	for sid := o.header.Difstart; sid != ENDOFCHAIN && fatRead < o.header.Cfat; {
+		if sid == FREESECT {
+			break
+		}
+		if difRead >= cdifLimit {
+			return fmt.Errorf("DIFAT chain exceeds Cdif limit: %d", cdifLimit)
+		}
+		if _, ok := visitedDif[sid]; ok {
+			return fmt.Errorf("DIFAT chain cycle detected at sid: %d", sid)
+		}
+		visitedDif[sid] = struct{}{}
+		if err := validateSID(sid, maxSID, "DIFAT sector"); err != nil {
+			return err
+		}
 		if sector, err := o.sector_read(sid); err == nil {
 			sids := sector.MsatValues(o.Lsector)
 
-			for _, sid := range sids {
-				if sector, err := o.sector_read(sid); err == nil {
+			for _, fatSID := range sids {
+				if fatRead >= o.header.Cfat {
+					break
+				}
+				if fatSID == FREESECT || fatSID == ENDOFCHAIN {
+					continue
+				}
+				if err := validateSID(fatSID, maxSID, "DIFAT FAT"); err != nil {
+					return err
+				}
+				if sector, err := o.sector_read(fatSID); err == nil {
 					sids := sector.AllValues(o.Lsector)
 
 					o.SecID = append(o.SecID, sids...)
+					fatRead++
 				} else {
 					return err
 				}
 			}
 
 			sid = sector.NextSid(o.Lsector)
+			difRead++
 		} else {
 			return err
 		}
+	}
+	if fatRead < o.header.Cfat {
+		return fmt.Errorf("incomplete FAT chain: expected %d sectors, got %d", o.header.Cfat, fatRead)
 	}
 
 	for i := uint32(0); i < o.header.Csfat; i++ {
@@ -117,6 +165,40 @@ func (o *Ole) readMSAT() error {
 	}
 	return nil
 
+}
+
+func (o *Ole) maxRegularSID() (uint32, uint32, error) {
+	current, err := o.reader.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return 0, 0, err
+	}
+	end, err := o.reader.Seek(0, io.SeekEnd)
+	if err != nil {
+		return 0, 0, err
+	}
+	if _, err := o.reader.Seek(current, io.SeekStart); err != nil {
+		return 0, 0, err
+	}
+	if end < int64(o.Lsector) {
+		return 0, 0, fmt.Errorf("invalid OLE file size: %d", end)
+	}
+
+	sectorCount64 := uint64(end-int64(o.Lsector)) / uint64(o.Lsector)
+	if sectorCount64 == 0 {
+		return 0, 0, fmt.Errorf("empty OLE sector area")
+	}
+	if sectorCount64 > uint64(^uint32(0))+1 {
+		return 0, 0, fmt.Errorf("too many sectors: %d", sectorCount64)
+	}
+	sectorCount := uint32(sectorCount64)
+	return sectorCount - 1, sectorCount, nil
+}
+
+func validateSID(sid uint32, maxSID uint32, label string) error {
+	if sid > maxSID {
+		return fmt.Errorf("%s sid out of range: %d > %d", label, sid, maxSID)
+	}
+	return nil
 }
 
 func (o *Ole) stream_read(sid uint32, size uint32) *StreamReader {
