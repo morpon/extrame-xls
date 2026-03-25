@@ -60,12 +60,16 @@ func OpenReader(reader io.ReadSeeker, charset string) (wb *WorkBook, err error) 
 				}
 			}
 			if book != nil {
+				if root == nil {
+					return nil, fmt.Errorf("invalid xls: root entry not found")
+				}
 				if err = validateWorkbookStreamSize(book.Size, fileSize); err != nil {
 					return nil, err
 				}
 				wb, err = newWorkBookFromOle2(ole.OpenFile(book, root), fileSize)
 				return wb, err
 			}
+			return nil, fmt.Errorf("invalid xls: workbook stream not found")
 		}
 	}
 	return
