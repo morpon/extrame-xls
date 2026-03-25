@@ -1,11 +1,14 @@
 package xls
 
 import (
+	"fmt"
 	"io"
 	"os"
 
 	"github.com/morpon/extrame-xls/ole2"
 )
+
+const maxWorkbookStreamToFileRatio int64 = 4
 
 // Open one xls file
 func Open(file string, charset string) (*WorkBook, error) {
@@ -28,6 +31,11 @@ func OpenWithCloser(file string, charset string) (*WorkBook, io.Closer, error) {
 
 // Open xls file from reader
 func OpenReader(reader io.ReadSeeker, charset string) (wb *WorkBook, err error) {
+	fileSize, err := seekReaderSize(reader)
+	if err != nil {
+		return nil, err
+	}
+
 	var ole *ole2.Ole
 	if ole, err = ole2.Open(reader, charset); err == nil {
 		var dir []*ole2.File
@@ -52,10 +60,40 @@ func OpenReader(reader io.ReadSeeker, charset string) (wb *WorkBook, err error) 
 				}
 			}
 			if book != nil {
-				wb = newWorkBookFromOle2(ole.OpenFile(book, root))
-				return
+				if err = validateWorkbookStreamSize(book.Size, fileSize); err != nil {
+					return nil, err
+				}
+				wb, err = newWorkBookFromOle2(ole.OpenFile(book, root), fileSize)
+				return wb, err
 			}
 		}
 	}
 	return
+}
+
+func seekReaderSize(reader io.ReadSeeker) (int64, error) {
+	current, err := reader.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return 0, err
+	}
+	end, err := reader.Seek(0, io.SeekEnd)
+	if err != nil {
+		return 0, err
+	}
+	if _, err := reader.Seek(current, io.SeekStart); err != nil {
+		return 0, err
+	}
+	if end <= 0 {
+		return 0, fmt.Errorf("invalid file size: %d", end)
+	}
+	return end, nil
+}
+
+func validateWorkbookStreamSize(streamSize uint32, fileSize int64) error {
+	declared := int64(streamSize)
+	maxAllowed := fileSize * maxWorkbookStreamToFileRatio
+	if declared > maxAllowed {
+		return fmt.Errorf("invalid workbook stream size: %d exceeds %dx file size (%d)", declared, maxWorkbookStreamToFileRatio, fileSize)
+	}
+	return nil
 }

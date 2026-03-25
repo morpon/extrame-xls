@@ -3,13 +3,20 @@ package xls
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"golang.org/x/text/encoding/charmap"
 	"io"
 	"os"
 	"unicode/utf16"
 )
 
-//xls workbook type
+const (
+	sstStringHeaderBytesEstimate int64  = 16
+	maxSSTToFileRatio            int64  = 16
+	maxAbsoluteSSTCount          uint32 = 10_000_000
+)
+
+// xls workbook type
 type WorkBook struct {
 	Is5ver   bool
 	Type     uint16
@@ -26,20 +33,25 @@ type WorkBook struct {
 	continue_rich  uint16
 	continue_apsb  uint32
 	dateMode       uint16
+	fileSize       int64
+	parseErr       error
 }
 
-//read workbook from ole2 file
-func newWorkBookFromOle2(rs io.ReadSeeker) *WorkBook {
+// read workbook from ole2 file
+func newWorkBookFromOle2(rs io.ReadSeeker, fileSize int64) (*WorkBook, error) {
 	wb := new(WorkBook)
 	wb.Formats = make(map[uint16]*Format)
 	// wb.bts = bts
 	wb.rs = rs
+	wb.fileSize = fileSize
 	wb.sheets = make([]*WorkSheet, 0)
-	wb.Parse(rs)
-	return wb
+	if err := wb.Parse(rs); err != nil {
+		return nil, err
+	}
+	return wb, nil
 }
 
-func (w *WorkBook) Parse(buf io.ReadSeeker) {
+func (w *WorkBook) Parse(buf io.ReadSeeker) error {
 	b := new(bof)
 	bof_pre := new(bof)
 	// buf := bytes.NewReader(bts)
@@ -47,10 +59,14 @@ func (w *WorkBook) Parse(buf io.ReadSeeker) {
 	for {
 		if err := binary.Read(buf, binary.LittleEndian, b); err == nil {
 			bof_pre, b, offset = w.parseBof(buf, b, bof_pre, offset)
+			if w.parseErr != nil {
+				return w.parseErr
+			}
 		} else {
 			break
 		}
 	}
+	return nil
 }
 
 func (w *WorkBook) addXf(xf st_xf_data) {
@@ -114,6 +130,10 @@ func (wb *WorkBook) parseBof(buf io.ReadSeeker, b *bof, pre *bof, offset_pre int
 	case 0xfc: // SST
 		info := new(SstInfo)
 		binary.Read(buf_item, binary.LittleEndian, info)
+		if err := wb.validateSSTCount(info.Count); err != nil {
+			wb.parseErr = err
+			return
+		}
 		wb.sst = make([]string, info.Count)
 		var size uint16
 		var i = 0
@@ -161,6 +181,21 @@ func (wb *WorkBook) parseBof(buf io.ReadSeeker, b *bof, pre *bof, offset_pre int
 		binary.Read(buf_item, binary.LittleEndian, &wb.dateMode)
 	}
 	return
+}
+
+func (w *WorkBook) validateSSTCount(count uint32) error {
+	if count > maxAbsoluteSSTCount {
+		return fmt.Errorf("invalid SST count: %d exceeds hard limit %d", count, maxAbsoluteSSTCount)
+	}
+	if w.fileSize <= 0 {
+		return nil
+	}
+	estimated := int64(count) * sstStringHeaderBytesEstimate
+	maxAllowed := w.fileSize * maxSSTToFileRatio
+	if estimated > maxAllowed {
+		return fmt.Errorf("invalid SST count: estimated memory %d exceeds %dx file size (%d)", estimated, maxSSTToFileRatio, w.fileSize)
+	}
+	return nil
 }
 func decodeWindows1251(enc []byte) string {
 	dec := charmap.Windows1251.NewDecoder()
@@ -258,13 +293,13 @@ func (w *WorkBook) addSheet(sheet *boundsheet, buf io.ReadSeeker) {
 	w.sheets = append(w.sheets, &WorkSheet{bs: sheet, Name: name, wb: w, Visibility: TWorkSheetVisibility(sheet.Visible)})
 }
 
-//reading a sheet from the compress file to memory, you should call this before you try to get anything from sheet
+// reading a sheet from the compress file to memory, you should call this before you try to get anything from sheet
 func (w *WorkBook) prepareSheet(sheet *WorkSheet) {
 	w.rs.Seek(int64(sheet.bs.Filepos), 0)
 	sheet.parse(w.rs)
 }
 
-//Get one sheet by its number
+// Get one sheet by its number
 func (w *WorkBook) GetSheet(num int) *WorkSheet {
 	if num < len(w.sheets) {
 		s := w.sheets[num]
@@ -277,14 +312,14 @@ func (w *WorkBook) GetSheet(num int) *WorkSheet {
 	}
 }
 
-//Get the number of all sheets, look into example
+// Get the number of all sheets, look into example
 func (w *WorkBook) NumSheets() int {
 	return len(w.sheets)
 }
 
-//helper function to read all cells from file
-//Notice: the max value is the limit of the max capacity of lines.
-//Warning: the helper function will need big memeory if file is large.
+// helper function to read all cells from file
+// Notice: the max value is the limit of the max capacity of lines.
+// Warning: the helper function will need big memeory if file is large.
 func (w *WorkBook) ReadAllCells(max int) (res [][]string) {
 	res = make([][]string, 0)
 	for _, sheet := range w.sheets {
